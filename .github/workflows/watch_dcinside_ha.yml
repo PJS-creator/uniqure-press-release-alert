@@ -1,0 +1,50 @@
+name: Watch DCInside (uniqure, ㅎㅇ)
+
+on:
+  schedule:
+    - cron: "2-59/5 * * * *"
+  workflow_dispatch:       # 수동 실행 버튼도 허용
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  dcinside-watch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run DCInside watcher
+        env:
+          DC_LIST_URL: "https://gall.dcinside.com/mini/board/lists/?id=uniqure"
+          TARGET_NICK: "ㅎㅇ"
+          STATE_FILE: "state_dcinside_ha.json"
+          ALERT_TO: "PJS-creator"   # ← 본인 깃허브 아이디
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          python watch_dcinside_ha.py
+
+      - name: Commit state if changed
+        run: |
+          if git diff --quiet; then
+            echo "No state change."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state_dcinside_ha.json
+          git commit -m "Update last seen DCInside post for TARGET_NICK"
+          git push
