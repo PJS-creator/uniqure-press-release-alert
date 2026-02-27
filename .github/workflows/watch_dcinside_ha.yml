@@ -29,7 +29,7 @@ jobs:
       - name: Run DCInside watcher
         env:
           DC_LIST_URL: "https://gall.dcinside.com/mini/board/lists/?id=uniqure"
-          TARGET_NICK: "브토"
+          TARGET_NICK: "ㅎㅇ"
           STATE_FILE: "state_dcinside_ha.json"
           ALERT_TO: "PJS-creator"   # ← 본인 깃허브 아이디
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
