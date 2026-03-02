@@ -1,192 +1,283 @@
 import json
 import os
 import re
+import sys
+import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Optional, List
+from typing import List, Optional
 from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
 
-MONTHS = "(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)"
-MONTHS_FULL = "(January|February|March|April|May|June|July|August|September|October|November|December)"
-DATE_RE = re.compile(rf"^[\u2022\*\-]?\s*{MONTHS}\s+\d{{1,2}},\s+\d{{4}}\s*$", re.IGNORECASE)
-DATE_RE2 = re.compile(rf"^[\u2022\*\-]?\s*{MONTHS_FULL}\s+\d{{1,2}},\s+\d{{4}}\s*$", re.IGNORECASE)
-
-SKIP_TOKENS = {"subscribe", "see all", "learn more", "contact", "menu"}
 
 @dataclass
-class PressRelease:
-    date: str
+class PressItem:
     title: str
     url: str
-    source_page: str
+    date: str = ""
+
+
+DATE_RE_EN = re.compile(r"\b([A-Z][a-z]+ \d{1,2}, \d{4})\b")  # e.g., March 02, 2026
+
+
+def log(msg: str) -> None:
+    print(msg, flush=True)
+
 
 def fetch_html(url: str, timeout: int = 30) -> str:
+    # Cache-bust to reduce stale HTML
+    sep = "&" if "?" in url else "?"
+    bust = f"{sep}_={int(time.time())}"
+
     headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; uniQure-watcher/1.0; +https://github.com/)"
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/123.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
     }
-    r = requests.get(url, headers=headers, timeout=timeout)
+
+    r = requests.get(url + bust, headers=headers, timeout=timeout, allow_redirects=True)
+    log(f"[fetch] {url} -> HTTP {r.status_code}, {len(r.text)} bytes")
     r.raise_for_status()
     return r.text
 
-def _clean_lines(text: str) -> List[str]:
-    lines = []
-    for ln in text.splitlines():
-        ln = ln.strip()
-        if not ln:
-            continue
-        ln = ln.replace("\u00a0", " ")
-        lines.append(ln)
-    return lines
 
-def _is_date_line(line: str) -> bool:
-    return bool(DATE_RE.match(line) or DATE_RE2.match(line))
-
-def _looks_like_noise(line: str) -> bool:
-    low = line.strip().lower()
-    if low in SKIP_TOKENS:
-        return True
-    if low.startswith("subscribe"):
-        return True
-    if low.startswith("©") or low.startswith("copyright"):
-        return True
-    return False
-
-def extract_latest_press_release(html: str, page_url: str) -> Optional[PressRelease]:
+def parse_globenewswire_list(html: str, page_url: str, max_items: int = 20) -> List[PressItem]:
+    """
+    Parse GlobeNewswire organization search results page:
+    https://www.globenewswire.com/search/organization/<...>
+    """
     soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text("\n", strip=True)
-    lines = _clean_lines(text)
 
-    start_candidates = []
-    for i, ln in enumerate(lines):
-        if "subscribe to receive breaking news alerts" in ln.lower():
-            start_candidates.append(i)
-    for i, ln in enumerate(lines):
-        if ln.strip().lower() == "press releases":
-            start_candidates.append(i)
+    items: List[PressItem] = []
+    seen_urls = set()
 
-    seen = set()
-    start_candidates_unique = []
-    for i in start_candidates:
-        if i not in seen:
-            start_candidates_unique.append(i)
-            seen.add(i)
+    # Find anchors that look like press release links
+    for a in soup.find_all("a", href=True):
+        href = a.get("href", "").strip()
+        title = a.get_text(" ", strip=True)
 
-    def parse_from(start_idx: int) -> Optional[PressRelease]:
-        chunk = lines[start_idx : start_idx + 200]
-        for i, ln in enumerate(chunk):
-            if _is_date_line(ln):
-                date = ln.strip("•*- ").strip()
-                for j in range(i + 1, min(i + 15, len(chunk))):
-                    title = chunk[j].strip()
-                    if not title or _looks_like_noise(title) or _is_date_line(title):
-                        continue
+        if not href or not title:
+            continue
 
-                    href = ""
-                    a = soup.find("a", string=lambda s: isinstance(s, str) and title.lower() in s.lower())
-                    if a and a.get("href"):
-                        href = a["href"]
+        t = title.lower()
+        if t in {"read more", "next page", "page suivante"}:
+            continue
+        if t.startswith("image:"):
+            continue
 
-                    abs_url = urljoin(page_url, href) if href else page_url
-                    return PressRelease(date=date, title=title, url=abs_url, source_page=page_url)
-        return None
+        if "/news-release/" not in href:
+            continue
 
-    for idx in start_candidates_unique:
-        pr = parse_from(idx)
-        if pr:
-            return pr
+        full_url = urljoin(page_url, href)
+        if full_url in seen_urls:
+            continue
+        seen_urls.add(full_url)
 
-    return parse_from(0)
+        # Find a date near this link (look up the DOM a bit)
+        date = ""
+        node = a
+        for _ in range(5):
+            if node is None or node.parent is None:
+                break
+            node = node.parent
+            blob = node.get_text(" ", strip=True)
+            m = DATE_RE_EN.search(blob)
+            if m:
+                date = m.group(1)
+                break
+
+        items.append(PressItem(title=title, url=full_url, date=date))
+
+        if len(items) >= max_items:
+            break
+
+    return items
+
+
+def parse_uniqure_fallback(html: str, page_url: str) -> List[PressItem]:
+    """
+    Very simple fallback parser for uniqure.com pages that contain a short press release list.
+    If the page is JS-rendered and empty, this will return [].
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text("\n")
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+    # Look for patterns like:
+    # Feb 23, 2026
+    # uniQure to Announce 2025 Financial Results
+    items: List[PressItem] = []
+    i = 0
+    while i < len(lines):
+        m = re.match(r"^[A-Z][a-z]{2} \d{1,2}, \d{4}$", lines[i])
+        if m and i + 1 < len(lines):
+            date = lines[i]
+            title = lines[i + 1].lstrip("# ").strip()
+            if title and len(title) > 6:
+                items.append(PressItem(title=title, url=page_url, date=date))
+                if len(items) >= 5:
+                    break
+            i += 2
+        else:
+            i += 1
+    return items
+
 
 def load_state(path: str) -> dict:
     if not os.path.exists(path):
-        return {"last_seen": ""}
+        return {}
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
-        return {"last_seen": ""}
+    except Exception as e:
+        log(f"[state] Failed to read {path}: {e}")
+        return {}
 
-def save_state(path: str, pr: PressRelease) -> None:
-    state = {
-        "last_seen": f"{pr.date} | {pr.title}",
-        "last_seen_date": pr.date,
-        "last_seen_title": pr.title,
-        "last_seen_url": pr.url,
-        "source_page": pr.source_page,
-        "updated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-    }
-    with open(path, "w", encoding="utf-8") as f:
+
+def save_state(path: str, state: dict) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
 
-def create_issue(repo: str, token: str, pr: PressRelease, alert_to: Optional[str]) -> None:
-    api_url = f"https://api.github.com/repos/{repo}/issues"
+
+def gh_create_issue(repo: str, token: str, title: str, body: str, assignee: Optional[str]) -> str:
+    url = f"https://api.github.com/repos/{repo}/issues"
     headers = {
-        "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
         "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "uniqure-watcher",
     }
-    title = f"[uniQure] New press release: {pr.date} — {pr.title}"
-    mention = f"@{alert_to}" if alert_to else ""
-    body = "\n".join([
-        "새로운 uniQure Press Release가 감지되었습니다.",
-        "",
-        f"- Date: {pr.date}",
-        f"- Title: {pr.title}",
-        f"- Link: {pr.url}",
-        f"- Source page watched: {pr.source_page}",
-        "",
-        mention,
-    ]).strip() + "\n"
-
     payload = {"title": title, "body": body}
-    if alert_to:
-        payload["assignees"] = [alert_to]
+    if assignee:
+        payload["assignees"] = [assignee]
 
-    r = requests.post(api_url, headers=headers, json=payload, timeout=30)
+    r = requests.post(url, headers=headers, json=payload, timeout=30)
     if r.status_code >= 300:
-        raise RuntimeError(f"Failed to create issue: {r.status_code} {r.text}")
+        raise RuntimeError(f"GitHub issue create failed: {r.status_code} {r.text}")
+    return r.json().get("html_url", "")
+
 
 def main() -> int:
-    watch_url = os.getenv("WATCH_URL", "https://www.uniqure.com/investors-media/press-releases")
-    fallback_url = os.getenv("FALLBACK_URL", "https://www.uniqure.com/investors-media")
-    state_file = os.getenv("STATE_FILE", "state.json")
+    watch_url = os.environ.get("WATCH_URL", "").strip()
+    fallback_url = os.environ.get("FALLBACK_URL", "").strip()
+    state_file = os.environ.get("STATE_FILE", "state.json").strip()
+    alert_to = os.environ.get("ALERT_TO", "").strip().lstrip("@")
 
-    github_repo = os.getenv("GITHUB_REPOSITORY", "")
-    github_token = os.getenv("GITHUB_TOKEN", "")
-    alert_to = os.getenv("ALERT_TO", "").strip() or None
+    repo = os.environ.get("GITHUB_REPOSITORY", "").strip()
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
 
-    pr = None
-    for url in [watch_url, fallback_url]:
-        try:
-            html = fetch_html(url)
-        except Exception:
-            continue
-        pr = extract_latest_press_release(html, url)
-        if pr:
-            break
-
-    if not pr:
-        return 0
+    if not watch_url:
+        log("[error] WATCH_URL is empty.")
+        return 1
+    if not repo or not token:
+        log("[error] Missing GITHUB_REPOSITORY or GITHUB_TOKEN.")
+        return 1
 
     state = load_state(state_file)
-    last_seen = state.get("last_seen", "")
-    current_key = f"{pr.date} | {pr.title}"
+    seen_urls: List[str] = state.get("seen_urls", [])
+    seen_set = set(seen_urls)
 
-    if not last_seen:
-        save_state(state_file, pr)
+    # Legacy compatibility: if old state stored a "last_seen_key" like "Feb 23, 2026|Title"
+    legacy_key = state.get("last_seen_key") or state.get("last_seen") or ""
+    legacy_title = ""
+    if isinstance(legacy_key, str) and "|" in legacy_key:
+        try:
+            _d, legacy_title = legacy_key.split("|", 1)
+            legacy_title = legacy_title.strip().lower()
+        except Exception:
+            legacy_title = ""
+
+    items: List[PressItem] = []
+
+    # Try WATCH_URL first
+    try:
+        html = fetch_html(watch_url)
+        if "globenewswire.com" in watch_url:
+            items = parse_globenewswire_list(html, watch_url)
+        else:
+            items = parse_uniqure_fallback(html, watch_url)
+    except Exception as e:
+        log(f"[warn] WATCH_URL failed: {e}")
+
+    # If empty, try FALLBACK_URL
+    if not items and fallback_url:
+        try:
+            html = fetch_html(fallback_url)
+            if "globenewswire.com" in fallback_url:
+                items = parse_globenewswire_list(html, fallback_url)
+            else:
+                items = parse_uniqure_fallback(html, fallback_url)
+        except Exception as e:
+            log(f"[warn] FALLBACK_URL failed: {e}")
+
+    if not items:
+        log("[result] No press release items found (page may be JS-rendered or blocked).")
         return 0
 
-    if current_key == last_seen:
+    log(f"[parse] Found {len(items)} item(s). Latest = {items[0].date} | {items[0].title} | {items[0].url}")
+
+    # Determine new items (top-down until we hit something seen or legacy marker)
+    new_items: List[PressItem] = []
+    for it in items:
+        if it.url in seen_set:
+            break
+        if legacy_title and it.title.strip().lower() == legacy_title:
+            break
+        new_items.append(it)
+
+    # First run protection: if we have no seen history and no legacy marker, just initialize.
+    if not seen_urls and not legacy_title:
+        state["seen_urls"] = [items[0].url]
+        state["last_seen_url"] = items[0].url
+        save_state(state_file, state)
+        log("[init] State initialized. (No alert on very first run.)")
         return 0
 
-    if github_repo and github_token:
-        create_issue(github_repo, github_token, pr, alert_to)
+    if not new_items:
+        log("[result] No new press releases.")
+        return 0
 
-    save_state(state_file, pr)
+    # Create issues oldest -> newest
+    created = 0
+    for it in reversed(new_items):
+        issue_title = f"[uniQure] {it.date} {it.title}".strip()
+        body_lines = [
+            "New press release detected.",
+            "",
+            f"- Date: {it.date}" if it.date else "- Date: (unknown)",
+            f"- Title: {it.title}",
+            f"- Link: {it.url}",
+        ]
+        if alert_to:
+            body_lines.append("")
+            body_lines.append(f"cc @{alert_to}")
+
+        issue_url = gh_create_issue(repo, token, issue_title[:240], "\n".join(body_lines), alert_to or None)
+        log(f"[issue] Created: {issue_url}")
+
+        # Update seen
+        seen_set.add(it.url)
+        seen_urls.insert(0, it.url)
+        seen_urls = seen_urls[:50]
+        created += 1
+
+    state["seen_urls"] = seen_urls
+    state["last_seen_url"] = items[0].url
+    # Keep legacy keys but update so you can still inspect
+    state["last_seen_key"] = f"{items[0].date}|{items[0].title}"
+    save_state(state_file, state)
+
+    log(f"[done] Created {created} issue(s).")
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
