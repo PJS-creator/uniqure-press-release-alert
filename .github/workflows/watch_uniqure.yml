@@ -28,7 +28,7 @@ jobs:
 
       - name: Run watcher
         env:
-          WATCH_URL: "https://www.uniqure.com/investors-media/press-releases"
+          WATCH_URL: "https://www.globenewswire.com/search/organization/uniQure%2520Inc%C2%A7"
           FALLBACK_URL: "https://www.uniqure.com/investors-media"
           STATE_FILE: "state.json"
           ALERT_TO: "PJS-creator"
