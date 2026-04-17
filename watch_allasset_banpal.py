@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import List, Optional
@@ -19,8 +20,12 @@ class DCPost:
 
 def fetch_html(url: str, session: requests.Session, timeout: int = 30) -> str:
     dc_cookie = os.getenv("DC_COOKIE", "").replace("\n", "").replace("\r", "").strip()
+    # 🛡️ 봇 차단 방지용 강력 위장막 헤더
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Connection": "keep-alive",
         "Cookie": dc_cookie
     }
     resp = session.get(url, headers=headers, timeout=timeout)
@@ -37,8 +42,7 @@ def parse_list(html: str, list_url: str, target_nick: str) -> List[DCPost]:
     for tr in rows:
         no_attr = tr.get("data-no")
         if not no_attr: continue
-        try:
-            no = int(str(no_attr).strip())
+        try: no = int(str(no_attr).strip())
         except ValueError: continue
 
         writer_td = tr.find("td", class_="gall_writer")
@@ -61,6 +65,7 @@ def parse_list(html: str, list_url: str, target_nick: str) -> List[DCPost]:
         
         posts.append(DCPost(no=no, title=title, author=nick, link=link, created=created))
     
+    posts.sort(key=lambda p: p.no, reverse=True)
     return posts
 
 def parse_article(html: str, post: DCPost) -> DCPost:
@@ -105,25 +110,17 @@ def main() -> int:
     alert_to = os.getenv("ALERT_TO", "").strip() or None
 
     session = requests.Session()
-    posts = []
     
-    # 💡 1페이지부터 3페이지(약 150개)까지 순회하며 타겟 글을 싹싹 긁어옵니다.
     try:
-        for page in range(1, 4):
-            page_url = f"{list_url}&page={page}"
-            html = fetch_html(page_url, session)
-            posts.extend(parse_list(html, list_url, target_nick))
+        # 💡 안전하게 딱 1페이지만 검사합니다.
+        html = fetch_html(list_url, session)
+        posts = parse_list(html, list_url, target_nick)
     except Exception as e: 
         print(f"Error fetching/parsing list: {e}")
         return 1
 
-    if not posts: 
-        print("최근 3페이지 내에 타겟 글이 없습니다.")
-        return 0
-        
-    # 글 번호 기준으로 내림차순 정렬 (최신 글이 맨 앞)
-    posts.sort(key=lambda p: p.no, reverse=True)
-
+    if not posts: return 0
+    
     state = load_state(state_file)
     last_seen_no = int(state.get("last_seen_no", 0))
     
@@ -134,6 +131,7 @@ def main() -> int:
     new_posts = sorted([p for p in posts if p.no > last_seen_no], key=lambda p: p.no)
     for post in new_posts:
         try:
+            time.sleep(1) # 본문 가져올 때 1초 대기 (안전장치)
             article_html = fetch_html(post.link, session)
             post_full = parse_article(article_html, post)
         except: post_full = post
