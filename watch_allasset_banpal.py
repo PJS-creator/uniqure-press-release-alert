@@ -18,18 +18,14 @@ class DCPost:
     body: str = ""
 
 def fetch_html(url: str, session: requests.Session, timeout: int = 30) -> str:
-    dc_cookie = os.getenv("DC_COOKIE", "")
-    if not dc_cookie:
-        print("[DEBUG] 🚨 DC_COOKIE 환경변수가 비어있습니다! 깃허브 Secret 설정을 다시 확인해주세요.")
-    else:
-        print(f"[DEBUG] ✅ 쿠키 로드 성공 (길이: {len(dc_cookie)}자)")
-        
+    # 💡 핵심 수정: 쿠키 텍스트 앞뒤의 줄바꿈(\n, \r)과 공백을 완벽하게 제거합니다.
+    dc_cookie = os.getenv("DC_COOKIE", "").replace("\n", "").replace("\r", "").strip()
+    
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Cookie": dc_cookie
     }
     resp = session.get(url, headers=headers, timeout=timeout)
-    print(f"[DEBUG] 🌐 응답 상태 코드: {resp.status_code}")
     resp.raise_for_status()
     resp.encoding = resp.apparent_encoding or "utf-8"
     return resp.text
@@ -62,41 +58,83 @@ def parse_list(html: str, list_url: str, target_nick: str) -> List[DCPost]:
         href = title_a.get("href", "")
         link = urljoin(list_url, href) if href else list_url
         
-        posts.append(DCPost(no=no, title=title, author=nick, link=link, created=""))
+        date_td = tr.find("td", class_="gall_date")
+        created = (date_td.get("title") or date_td.get_text(strip=True)).strip() if date_td else ""
+        
+        posts.append(DCPost(no=no, title=title, author=nick, link=link, created=created))
     
     posts.sort(key=lambda p: p.no, reverse=True)
     return posts
+
+def parse_article(html: str, post: DCPost) -> DCPost:
+    soup = BeautifulSoup(html, "html.parser")
+    title_el = soup.select_one(".title_subject")
+    if title_el: post.title = title_el.get_text(strip=True)
+    body_el = soup.select_one(".write_div")
+    post.body = body_el.get_text("\n", strip=True) if body_el else ""
+    return post
+
+def load_state(path: str) -> dict:
+    if not os.path.exists(path): return {"last_seen_no": 0, "initialized": False}
+    try:
+        with open(path, "r", encoding="utf-8") as f: return json.load(f)
+    except: return {"last_seen_no": 0, "initialized": False}
+
+def save_state(path: str, last_seen_no: int, initialized: bool = True) -> None:
+    state = {
+        "last_seen_no": int(last_seen_no),
+        "initialized": bool(initialized),
+        "updated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+def create_issue(repo: str, token: str, alert_to: Optional[str], post: DCPost) -> None:
+    api_url = f"https://api.github.com/repos/{repo}/issues"
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    issue_title = f"[AllAsset] {post.author} 새 글: {post.title}"
+    mention = f"@{alert_to}" if alert_to else ""
+    body = f"올에셋 미니갤 새 글 감지\n\n- 작성자: {post.author}\n- 제목: {post.title}\n- 링크: {post.link}\n\n--- 본문 ---\n{post.body[:4000]}\n\n{mention}"
+    payload = {"title": issue_title, "body": body}
+    if alert_to: payload["assignees"] = [alert_to]
+    requests.post(api_url, headers=headers, json=payload, timeout=30)
 
 def main() -> int:
     list_url = "https://gall.dcinside.com/mini/board/lists/?id=allasset"
     target_nick = "반팔"
     state_file = "state_allasset_banpal.json"
+    github_repo = os.getenv("GITHUB_REPOSITORY", "")
+    github_token = os.getenv("GITHUB_TOKEN", "")
+    alert_to = os.getenv("ALERT_TO", "").strip() or None
 
-    print("=== 디버그 모드 크롤링 시작 ===")
     session = requests.Session()
-    
     try:
         html = fetch_html(list_url, session)
-        print(f"[DEBUG] 📄 HTML 가져오기 완료 (텍스트 길이: {len(html)})")
-        
-        # 권한 체크
-        if "접근 제한" in html or "접근 권한" in html or "로그인" in html:
-            print("[ERROR] 🚫 갤러리 접근 권한이 없습니다! (쿠키 만료, 권한 부족, 또는 봇 차단)")
-            return 1
-            
         posts = parse_list(html, list_url, target_nick)
-        print(f"[DEBUG] 🎯 파싱 완료. 현재 1페이지에서 '{target_nick}' 님의 글을 {len(posts)}개 찾았습니다.")
-        
-        if not posts:
-            print("[DEBUG] 텅 비어있습니다. 해당 닉네임의 글이 현재 1페이지에 없거나, HTML 구조가 다릅니다.")
-            return 0
-            
-    except Exception as e:
-        print(f"[CRITICAL ERROR] 💥 파이썬 실행 중 치명적 에러 발생: {e}")
+    except Exception as e: 
+        print(f"Error fetching/parsing list: {e}")
         return 1
 
-    # 이후 이슈 생성 로직은 임시로 주석 처리 (원인 파악이 먼저입니다)
-    print("=== 디버그 테스트 완료 ===")
+    if not posts: return 0
+    state = load_state(state_file)
+    last_seen_no = int(state.get("last_seen_no", 0))
+    
+    if not bool(state.get("initialized", False)):
+        save_state(state_file, posts[0].no, initialized=True)
+        return 0
+
+    new_posts = sorted([p for p in posts if p.no > last_seen_no], key=lambda p: p.no)
+    for post in new_posts:
+        try:
+            article_html = fetch_html(post.link, session)
+            post_full = parse_article(article_html, post)
+        except: post_full = post
+        
+        if github_repo and github_token:
+            create_issue(github_repo, github_token, alert_to, post_full)
+        
+        last_seen_no = post.no
+        save_state(state_file, last_seen_no, initialized=True)
     return 0
 
 if __name__ == "__main__":
