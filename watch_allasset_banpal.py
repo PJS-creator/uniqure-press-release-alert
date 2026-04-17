@@ -1,7 +1,6 @@
 import json
 import os
 import sys
-import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import List, Optional
@@ -19,13 +18,11 @@ class DCPost:
     body: str = ""
 
 def fetch_html(url: str, session: requests.Session, timeout: int = 30) -> str:
+    # 💡 핵심 수정: 쿠키 텍스트 앞뒤의 줄바꿈(\n, \r)과 공백을 완벽하게 제거합니다.
     dc_cookie = os.getenv("DC_COOKIE", "").replace("\n", "").replace("\r", "").strip()
-    # 🛡️ 봇 차단 방지용 강력 위장막 헤더
+    
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Connection": "keep-alive",
         "Cookie": dc_cookie
     }
     resp = session.get(url, headers=headers, timeout=timeout)
@@ -42,7 +39,8 @@ def parse_list(html: str, list_url: str, target_nick: str) -> List[DCPost]:
     for tr in rows:
         no_attr = tr.get("data-no")
         if not no_attr: continue
-        try: no = int(str(no_attr).strip())
+        try:
+            no = int(str(no_attr).strip())
         except ValueError: continue
 
         writer_td = tr.find("td", class_="gall_writer")
@@ -110,9 +108,7 @@ def main() -> int:
     alert_to = os.getenv("ALERT_TO", "").strip() or None
 
     session = requests.Session()
-    
     try:
-        # 💡 안전하게 딱 1페이지만 검사합니다.
         html = fetch_html(list_url, session)
         posts = parse_list(html, list_url, target_nick)
     except Exception as e: 
@@ -120,7 +116,6 @@ def main() -> int:
         return 1
 
     if not posts: return 0
-    
     state = load_state(state_file)
     last_seen_no = int(state.get("last_seen_no", 0))
     
@@ -131,7 +126,6 @@ def main() -> int:
     new_posts = sorted([p for p in posts if p.no > last_seen_no], key=lambda p: p.no)
     for post in new_posts:
         try:
-            time.sleep(1) # 본문 가져올 때 1초 대기 (안전장치)
             article_html = fetch_html(post.link, session)
             post_full = parse_article(article_html, post)
         except: post_full = post
