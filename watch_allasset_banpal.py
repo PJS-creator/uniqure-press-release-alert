@@ -18,9 +18,7 @@ class DCPost:
     body: str = ""
 
 def fetch_html(url: str, session: requests.Session, timeout: int = 30) -> str:
-    # 💡 핵심 수정: 쿠키 텍스트 앞뒤의 줄바꿈(\n, \r)과 공백을 완벽하게 제거합니다.
     dc_cookie = os.getenv("DC_COOKIE", "").replace("\n", "").replace("\r", "").strip()
-    
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Cookie": dc_cookie
@@ -63,7 +61,6 @@ def parse_list(html: str, list_url: str, target_nick: str) -> List[DCPost]:
         
         posts.append(DCPost(no=no, title=title, author=nick, link=link, created=created))
     
-    posts.sort(key=lambda p: p.no, reverse=True)
     return posts
 
 def parse_article(html: str, post: DCPost) -> DCPost:
@@ -108,14 +105,25 @@ def main() -> int:
     alert_to = os.getenv("ALERT_TO", "").strip() or None
 
     session = requests.Session()
+    posts = []
+    
+    # 💡 1페이지부터 3페이지(약 150개)까지 순회하며 타겟 글을 싹싹 긁어옵니다.
     try:
-        html = fetch_html(list_url, session)
-        posts = parse_list(html, list_url, target_nick)
+        for page in range(1, 4):
+            page_url = f"{list_url}&page={page}"
+            html = fetch_html(page_url, session)
+            posts.extend(parse_list(html, list_url, target_nick))
     except Exception as e: 
         print(f"Error fetching/parsing list: {e}")
         return 1
 
-    if not posts: return 0
+    if not posts: 
+        print("최근 3페이지 내에 타겟 글이 없습니다.")
+        return 0
+        
+    # 글 번호 기준으로 내림차순 정렬 (최신 글이 맨 앞)
+    posts.sort(key=lambda p: p.no, reverse=True)
+
     state = load_state(state_file)
     last_seen_no = int(state.get("last_seen_no", 0))
     
